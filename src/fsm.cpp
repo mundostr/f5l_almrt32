@@ -1,174 +1,261 @@
 #include "fsm.h"
 
+#include "bmp280.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
-#include "freertos/task.h"
+#include "freertos/timers.h"
 
-namespace almrt
+namespace fsm
 {
-    namespace fsm
+    constexpr char TAG[] = "almrt_fsm";
+    constexpr UBaseType_t EVENT_QUEUE_LENGTH = 8;
+    constexpr uint32_t FSM_TASK_STACK_SIZE = 3072;
+    constexpr UBaseType_t FSM_TASK_PRIORITY = 5;
+    constexpr uint32_t THROTTLE_GUARD_DURATION_MS = 2000;
+
+    enum class State : unsigned char
     {
-        namespace
+        BOOT,
+        THROTTLE_GUARD,
+        GROUND_REFERENCE,
+        READY,
+        MOTOR_RUNNING,
+        LOCKED,
+        FAULT
+    };
+
+    struct EventMessage
+    {
+        Event event;
+        float value;
+    };
+
+    static QueueHandle_t event_queue = nullptr;
+    static TimerHandle_t throttle_guard_timer = nullptr;
+    static State current_state = State::BOOT;
+    static portMUX_TYPE ground_reference_mux = portMUX_INITIALIZER_UNLOCKED;
+    static float ground_reference_pressure_pa = 0.0F;
+    static bool ground_reference_valid = false;
+    static bool throttle_guard_elapsed = false;
+
+    static const char *state_name(State state)
+    {
+        switch (state)
         {
-
-            const char *TAG = "almrt_fsm";
-            const UBaseType_t EVENT_QUEUE_LENGTH = 8;
-            const uint32_t FSM_TASK_STACK_SIZE = 3072;
-            const UBaseType_t FSM_TASK_PRIORITY = 5;
-
-            enum class State : unsigned char
-            {
-                BOOT,
-                THROTTLE_GUARD,
-                GROUND_REFERENCE,
-                READY,
-                MOTOR_RUNNING,
-                LOCKED
-            };
-
-            QueueHandle_t event_queue = nullptr;
-            State current_state = State::BOOT;
-
-            const char *state_name(State state)
-            {
-                switch (state)
-                {
-                case State::BOOT:
-                    return "BOOT";
-                case State::THROTTLE_GUARD:
-                    return "THROTTLE_GUARD";
-                case State::GROUND_REFERENCE:
-                    return "GROUND_REFERENCE";
-                case State::READY:
-                    return "READY";
-                case State::MOTOR_RUNNING:
-                    return "MOTOR_RUNNING";
-                case State::LOCKED:
-                    return "LOCKED";
-                }
-
-                return "UNKNOWN";
-            }
-
-            void transition_to(State next_state)
-            {
-                if (current_state == next_state)
-                {
-                    return;
-                }
-
-                ESP_LOGI(TAG, "%s -> %s", state_name(current_state), state_name(next_state));
-                current_state = next_state;
-            }
-
-            void process_event(Event event)
-            {
-                switch (current_state)
-                {
-                case State::BOOT:
-                    if (event == Event::SYSTEM_STARTED)
-                    {
-                        transition_to(State::THROTTLE_GUARD);
-                        return;
-                    }
-                    break;
-
-                case State::THROTTLE_GUARD:
-                    if (event == Event::ARMING_DELAY_ELAPSED)
-                    {
-                        transition_to(State::GROUND_REFERENCE);
-                        return;
-                    }
-                    break;
-
-                case State::GROUND_REFERENCE:
-                    if (event == Event::GROUND_REFERENCE_CAPTURED)
-                    {
-                        transition_to(State::READY);
-                        return;
-                    }
-                    break;
-
-                case State::READY:
-                    if (event == Event::MOTOR_START_DETECTED)
-                    {
-                        transition_to(State::MOTOR_RUNNING);
-                        return;
-                    }
-                    break;
-
-                case State::MOTOR_RUNNING:
-                    if (event == Event::MANUAL_MOTOR_STOP || event == Event::ALTITUDE_LIMIT_REACHED || event == Event::MOTOR_TIME_LIMIT_REACHED)
-                    {
-                        transition_to(State::LOCKED);
-                        return;
-                    }
-                    break;
-
-                case State::LOCKED:
-                    break;
-                }
-
-                ESP_LOGW(TAG, "Ignoring event %u in state %s",
-                         static_cast<unsigned int>(event), state_name(current_state));
-            }
-
-            void fsm_task(void *)
-            {
-                Event event;
-                for (;;)
-                {
-                    if (xQueueReceive(event_queue, &event, portMAX_DELAY) == pdPASS)
-                    {
-                        process_event(event);
-                    }
-                }
-            }
-
+        case State::BOOT:
+            return "BOOT";
+        case State::THROTTLE_GUARD:
+            return "THROTTLE_GUARD";
+        case State::GROUND_REFERENCE:
+            return "GROUND_REFERENCE";
+        case State::READY:
+            return "READY";
+        case State::MOTOR_RUNNING:
+            return "MOTOR_RUNNING";
+        case State::LOCKED:
+            return "LOCKED";
+        case State::FAULT:
+            return "FAULT";
         }
 
-        esp_err_t start()
+        return "UNKNOWN";
+    }
+
+    static void enter_state(State next_state)
+    {
+        current_state = next_state;
+        ESP_LOGI(TAG, "Entered state %s", state_name(current_state));
+
+        if (next_state == State::THROTTLE_GUARD)
         {
-            if (event_queue != nullptr)
+            if (xTimerStart(throttle_guard_timer, 0) != pdPASS)
             {
-                return ESP_ERR_INVALID_STATE;
+                current_state = State::FAULT;
+                ESP_LOGE(TAG, "Failed to start throttle guard timer; entering FAULT");
+                return;
             }
 
-            event_queue = xQueueCreate(EVENT_QUEUE_LENGTH, sizeof(Event));
-            if (event_queue == nullptr)
+            const esp_err_t error = bmp280::start_ground_reference();
+            if (error != ESP_OK)
             {
-                return ESP_ERR_NO_MEM;
+                current_state = State::FAULT;
+                ESP_LOGE(TAG, "Failed to start BMP280 capture: %s", esp_err_to_name(error));
+                return;
             }
 
-            const Event initial_event = Event::SYSTEM_STARTED;
-            if (xQueueSend(event_queue, &initial_event, 0) != pdPASS)
-            {
-                vQueueDelete(event_queue);
-                event_queue = nullptr;
-                return ESP_FAIL;
-            }
+            ESP_LOGI(TAG, "Device armed; throttle start is ignored for 2 seconds");
+        }
+    }
 
-            if (xTaskCreate(fsm_task, "almrt_fsm", FSM_TASK_STACK_SIZE, nullptr,
-                            FSM_TASK_PRIORITY, nullptr) != pdPASS)
+    static void process_event(const EventMessage &message)
+    {
+        switch (current_state)
+        {
+        case State::BOOT:
+            if (message.event == Event::SYSTEM_STARTED)
             {
-                vQueueDelete(event_queue);
-                event_queue = nullptr;
-                return ESP_ERR_NO_MEM;
+                enter_state(State::THROTTLE_GUARD);
+                return;
             }
+            break;
 
-            return ESP_OK;
+        case State::THROTTLE_GUARD:
+            if (message.event == Event::ARMING_DELAY_ELAPSED)
+            {
+                throttle_guard_elapsed = true;
+                enter_state(ground_reference_valid ? State::READY : State::GROUND_REFERENCE);
+                return;
+            }
+            if (message.event == Event::GROUND_REFERENCE_CAPTURED)
+            {
+                portENTER_CRITICAL(&ground_reference_mux);
+                ground_reference_pressure_pa = message.value;
+                ground_reference_valid = true;
+                portEXIT_CRITICAL(&ground_reference_mux);
+                return;
+            }
+            if (message.event == Event::GROUND_REFERENCE_FAILED)
+            {
+                enter_state(State::FAULT);
+                return;
+            }
+            break;
+
+        case State::GROUND_REFERENCE:
+            if (message.event == Event::GROUND_REFERENCE_CAPTURED)
+            {
+                portENTER_CRITICAL(&ground_reference_mux);
+                ground_reference_pressure_pa = message.value;
+                ground_reference_valid = true;
+                portEXIT_CRITICAL(&ground_reference_mux);
+                enter_state(State::READY);
+                return;
+            }
+            if (message.event == Event::GROUND_REFERENCE_FAILED)
+            {
+                enter_state(State::FAULT);
+                return;
+            }
+            break;
+
+        case State::READY:
+            if (message.event == Event::MOTOR_START_DETECTED)
+            {
+                enter_state(State::MOTOR_RUNNING);
+                return;
+            }
+            break;
+
+        case State::MOTOR_RUNNING:
+            if (message.event == Event::MANUAL_MOTOR_STOP || message.event == Event::ALTITUDE_LIMIT_REACHED || message.event == Event::MOTOR_TIME_LIMIT_REACHED)
+            {
+                enter_state(State::LOCKED);
+                return;
+            }
+            break;
+
+        case State::LOCKED:
+        case State::FAULT:
+            break;
         }
 
-        esp_err_t post_event(Event event)
-        {
-            if (event_queue == nullptr)
-            {
-                return ESP_ERR_INVALID_STATE;
-            }
+        ESP_LOGW(TAG, "Ignoring event %u in state %s",
+                 static_cast<unsigned int>(message.event), state_name(current_state));
+    }
 
-            return xQueueSend(event_queue, &event, 0) == pdPASS ? ESP_OK : ESP_ERR_TIMEOUT;
+    static void fsm_task(void *)
+    {
+        EventMessage message = {};
+        for (;;)
+        {
+            if (xQueueReceive(event_queue, &message, portMAX_DELAY) == pdPASS)
+            {
+                process_event(message);
+            }
+        }
+    }
+
+    static void throttle_guard_timer_callback(TimerHandle_t)
+    {
+        const esp_err_t error = post_event(Event::ARMING_DELAY_ELAPSED);
+        if (error != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Failed to post throttle-guard completion: %s", esp_err_to_name(error));
+        }
+    }
+
+    esp_err_t start()
+    {
+        if (event_queue != nullptr)
+        {
+            return ESP_ERR_INVALID_STATE;
         }
 
+        event_queue = xQueueCreate(EVENT_QUEUE_LENGTH, sizeof(EventMessage));
+        if (event_queue == nullptr)
+        {
+            return ESP_ERR_NO_MEM;
+        }
+
+        throttle_guard_timer = xTimerCreate(
+            "throttle_guard",
+            pdMS_TO_TICKS(THROTTLE_GUARD_DURATION_MS),
+            pdFALSE,
+            nullptr,
+            throttle_guard_timer_callback);
+        if (throttle_guard_timer == nullptr)
+        {
+            vQueueDelete(event_queue);
+            event_queue = nullptr;
+            return ESP_ERR_NO_MEM;
+        }
+
+        if (xTaskCreate(fsm_task, "almrt_fsm", FSM_TASK_STACK_SIZE, nullptr,
+                        FSM_TASK_PRIORITY, nullptr) != pdPASS)
+        {
+            xTimerDelete(throttle_guard_timer, 0);
+            throttle_guard_timer = nullptr;
+            vQueueDelete(event_queue);
+            event_queue = nullptr;
+            return ESP_ERR_NO_MEM;
+        }
+
+        const esp_err_t error = post_event(Event::SYSTEM_STARTED);
+        if (error != ESP_OK)
+        {
+            return error;
+        }
+
+        return ESP_OK;
+    }
+
+    esp_err_t post_event(Event event, float value)
+    {
+        if (event_queue == nullptr)
+        {
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        const EventMessage message = {event, value};
+        return xQueueSend(event_queue, &message, 0) == pdPASS ? ESP_OK : ESP_ERR_TIMEOUT;
+    }
+
+    bool get_ground_reference_pressure_pa(float *pressure_pa)
+    {
+        if (pressure_pa == nullptr)
+        {
+            return false;
+        }
+
+        portENTER_CRITICAL(&ground_reference_mux);
+        const bool valid = ground_reference_valid;
+        if (valid)
+        {
+            *pressure_pa = ground_reference_pressure_pa;
+        }
+        portEXIT_CRITICAL(&ground_reference_mux);
+
+        return valid;
     }
 }

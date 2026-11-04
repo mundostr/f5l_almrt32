@@ -1,0 +1,13 @@
+#pragma once
+
+#include <stdint.h>
+
+#include "esp_err.h"
+
+namespace bmp280
+{
+    constexpr uint32_t PRESSURE_READING_INTERVAL_MS = 100;
+    constexpr uint8_t GROUND_REFERENCE_SAMPLE_COUNT = 15;
+
+    esp_err_t start_ground_reference();
+}
