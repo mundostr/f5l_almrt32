@@ -7,6 +7,7 @@
 #include "board_config.h"
 #include "driver/i2c_master.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "fsm.h"
@@ -28,6 +29,8 @@ namespace bmp280
     constexpr uint32_t BMP280_TASK_STACK_SIZE = 4096;
     constexpr UBaseType_t BMP280_TASK_PRIORITY = 4;
     constexpr uint32_t BMP280_CONVERSION_DELAY_MS = 50;
+    constexpr int64_t GROUND_REFERENCE_SAMPLE_TIME_BUDGET_US =
+        static_cast<int64_t>(BMP280_CONVERSION_DELAY_MS + 2 * I2C_TIMEOUT_MS) * 1000;
     constexpr float MINIMUM_PRESSURE_PA = 70000.0F;
     constexpr float MAXIMUM_PRESSURE_PA = 110000.0F;
     constexpr double MINIMUM_SENSOR_TEMPERATURE_C = -40.0;
@@ -90,6 +93,7 @@ namespace bmp280
     static bool task_started = false;
     static bool ground_reference_ready = false;
     static double ground_reference_altitude_m = 0.0;
+    static int64_t ground_reference_deadline_us = 0;
     static TaskHandle_t sensor_task_handle = nullptr;
 
     static uint16_t read_u16_le(const uint8_t *data)
@@ -102,24 +106,88 @@ namespace bmp280
         return static_cast<int16_t>(read_u16_le(data));
     }
 
-    static esp_err_t read_registers(uint8_t register_address, uint8_t *data, size_t length)
+    static esp_err_t get_i2c_timeout_ms(int64_t deadline_us, uint32_t *timeout_ms)
     {
-        return i2c_master_transmit_receive(
+        if (deadline_us == 0)
+        {
+            *timeout_ms = I2C_TIMEOUT_MS;
+            return ESP_OK;
+        }
+
+        const int64_t remaining_us = deadline_us - esp_timer_get_time();
+        if (remaining_us <= 0)
+        {
+            return ESP_ERR_TIMEOUT;
+        }
+
+        const uint32_t remaining_ms = static_cast<uint32_t>(remaining_us / 1000);
+        if (remaining_ms == 0)
+        {
+            return ESP_ERR_TIMEOUT;
+        }
+        *timeout_ms = std::min(I2C_TIMEOUT_MS, remaining_ms);
+        return ESP_OK;
+    }
+
+    static esp_err_t read_registers(
+        uint8_t register_address,
+        uint8_t *data,
+        size_t length,
+        int64_t deadline_us = 0)
+    {
+        uint32_t timeout_ms = 0;
+        esp_err_t error = get_i2c_timeout_ms(deadline_us, &timeout_ms);
+        if (error != ESP_OK)
+        {
+            return error;
+        }
+
+        error = i2c_master_transmit_receive(
             sensor_device,
             &register_address,
             sizeof(register_address),
             data,
             length,
-            I2C_TIMEOUT_MS);
+            timeout_ms);
+        if (error != ESP_OK)
+        {
+            return error;
+        }
+
+        return deadline_us != 0 && esp_timer_get_time() >= deadline_us
+            ? ESP_ERR_TIMEOUT
+            : ESP_OK;
     }
 
-    static esp_err_t write_register(uint8_t register_address, uint8_t value)
+    static esp_err_t write_register(
+        uint8_t register_address,
+        uint8_t value,
+        int64_t deadline_us = 0)
     {
+        uint32_t timeout_ms = 0;
+        esp_err_t error = get_i2c_timeout_ms(deadline_us, &timeout_ms);
+        if (error != ESP_OK)
+        {
+            return error;
+        }
+
         const uint8_t data[] = {register_address, value};
-        return i2c_master_transmit(sensor_device, data, sizeof(data), I2C_TIMEOUT_MS);
+        error = i2c_master_transmit(
+            sensor_device,
+            data,
+            sizeof(data),
+            timeout_ms);
+        if (error != ESP_OK)
+        {
+            return error;
+        }
+
+        return deadline_us != 0 && esp_timer_get_time() >= deadline_us
+            ? ESP_ERR_TIMEOUT
+            : ESP_OK;
     }
 
-    static esp_err_t initialize_sensor()
+    static esp_err_t initialize_sensor(int64_t deadline_us)
     {
         i2c_master_bus_config_t bus_config = {};
         bus_config.i2c_port = I2C_NUM_0;
@@ -134,17 +202,36 @@ namespace bmp280
         {
             return error;
         }
+        if (esp_timer_get_time() >= deadline_us)
+        {
+            return ESP_ERR_TIMEOUT;
+        }
 
         uint8_t sensor_address = BMP280_ADDRESS_PRIMARY;
-        error = i2c_master_probe(i2c_bus, sensor_address, I2C_TIMEOUT_MS);
+        uint32_t timeout_ms = 0;
+        error = get_i2c_timeout_ms(deadline_us, &timeout_ms);
         if (error != ESP_OK)
         {
-            sensor_address = BMP280_ADDRESS_SECONDARY;
-            error = i2c_master_probe(i2c_bus, sensor_address, I2C_TIMEOUT_MS);
+            return error;
+        }
+        error = i2c_master_probe(i2c_bus, sensor_address, timeout_ms);
+        if (error != ESP_OK)
+        {
+            error = get_i2c_timeout_ms(deadline_us, &timeout_ms);
             if (error != ESP_OK)
             {
                 return error;
             }
+            sensor_address = BMP280_ADDRESS_SECONDARY;
+            error = i2c_master_probe(i2c_bus, sensor_address, timeout_ms);
+            if (error != ESP_OK)
+            {
+                return error;
+            }
+        }
+        if (esp_timer_get_time() >= deadline_us)
+        {
+            return ESP_ERR_TIMEOUT;
         }
 
         i2c_device_config_t device_config = {};
@@ -157,9 +244,13 @@ namespace bmp280
         {
             return error;
         }
+        if (esp_timer_get_time() >= deadline_us)
+        {
+            return ESP_ERR_TIMEOUT;
+        }
 
         uint8_t chip_id = 0;
-        error = read_registers(REG_CHIP_ID, &chip_id, sizeof(chip_id));
+        error = read_registers(REG_CHIP_ID, &chip_id, sizeof(chip_id), deadline_us);
         if (error != ESP_OK)
         {
             return error;
@@ -170,15 +261,27 @@ namespace bmp280
             return ESP_ERR_NOT_SUPPORTED;
         }
 
-        error = write_register(REG_RESET, BMP280_RESET_COMMAND);
+        error = write_register(REG_RESET, BMP280_RESET_COMMAND, deadline_us);
         if (error != ESP_OK)
         {
             return error;
         }
+        if (deadline_us - esp_timer_get_time() <= 5000)
+        {
+            return ESP_ERR_TIMEOUT;
+        }
         vTaskDelay(pdMS_TO_TICKS(5));
+        if (esp_timer_get_time() >= deadline_us)
+        {
+            return ESP_ERR_TIMEOUT;
+        }
 
         uint8_t calibration_bytes[24] = {};
-        error = read_registers(REG_CALIBRATION, calibration_bytes, sizeof(calibration_bytes));
+        error = read_registers(
+            REG_CALIBRATION,
+            calibration_bytes,
+            sizeof(calibration_bytes),
+            deadline_us);
         if (error != ESP_OK)
         {
             return error;
@@ -203,21 +306,39 @@ namespace bmp280
             return ESP_ERR_INVALID_RESPONSE;
         }
 
-        return write_register(REG_CONFIG, BMP280_CONFIG_VALUE);
+        return write_register(REG_CONFIG, BMP280_CONFIG_VALUE, deadline_us);
     }
 
-    static esp_err_t read_pressure_pa(float *pressure_pa)
+    static esp_err_t read_pressure_pa(float *pressure_pa, int64_t deadline_us = 0)
     {
-        esp_err_t error = write_register(REG_CTRL_MEAS, BMP280_FORCED_MEASUREMENT);
+        if (deadline_us != 0
+            && deadline_us - esp_timer_get_time()
+                <= GROUND_REFERENCE_SAMPLE_TIME_BUDGET_US)
+        {
+            return ESP_ERR_TIMEOUT;
+        }
+
+        esp_err_t error = write_register(
+            REG_CTRL_MEAS,
+            BMP280_FORCED_MEASUREMENT,
+            deadline_us);
         if (error != ESP_OK)
         {
             return error;
         }
 
         vTaskDelay(pdMS_TO_TICKS(BMP280_CONVERSION_DELAY_MS));
+        if (deadline_us != 0 && esp_timer_get_time() >= deadline_us)
+        {
+            return ESP_ERR_TIMEOUT;
+        }
 
         uint8_t data[6] = {};
-        error = read_registers(REG_PRESSURE_DATA, data, sizeof(data));
+        error = read_registers(
+            REG_PRESSURE_DATA,
+            data,
+            sizeof(data),
+            deadline_us);
         if (error != ESP_OK)
         {
             return error;
@@ -268,6 +389,10 @@ namespace bmp280
         {
             return ESP_ERR_INVALID_RESPONSE;
         }
+        if (deadline_us != 0 && esp_timer_get_time() >= deadline_us)
+        {
+            return ESP_ERR_TIMEOUT;
+        }
 
         *pressure_pa = static_cast<float>(pressure);
         return ESP_OK;
@@ -282,14 +407,16 @@ namespace bmp280
                 ISA_ALTITUDE_EXPONENT));
     }
 
-    static esp_err_t collect_ground_reference(float *reference_pressure_pa)
+    static esp_err_t collect_ground_reference(
+        float *reference_pressure_pa,
+        int64_t deadline_us)
     {
         std::array<float, GROUND_REFERENCE_SAMPLE_COUNT> samples = {};
         TickType_t last_wake_time = xTaskGetTickCount();
 
         for (size_t index = 0; index < samples.size(); ++index)
         {
-            esp_err_t error = read_pressure_pa(&samples[index]);
+            esp_err_t error = read_pressure_pa(&samples[index], deadline_us);
             if (error != ESP_OK)
             {
                 return error;
@@ -297,6 +424,13 @@ namespace bmp280
 
             if (index + 1 < samples.size())
             {
+                const int64_t remaining_us = deadline_us - esp_timer_get_time();
+                if (remaining_us
+                    <= static_cast<int64_t>(PRESSURE_READING_INTERVAL_MS) * 1000)
+                {
+                    return ESP_ERR_TIMEOUT;
+                }
+
                 vTaskDelayUntil(
                     &last_wake_time,
                     pdMS_TO_TICKS(PRESSURE_READING_INTERVAL_MS));
@@ -408,7 +542,8 @@ namespace bmp280
 
     static void ground_reference_task(void *)
     {
-        esp_err_t error = initialize_sensor();
+        const int64_t deadline_us = ground_reference_deadline_us;
+        esp_err_t error = initialize_sensor(deadline_us);
         if (error != ESP_OK)
         {
             report_sensor_error(error);
@@ -417,10 +552,17 @@ namespace bmp280
         }
 
         float reference_pressure_pa = 0.0F;
-        error = collect_ground_reference(&reference_pressure_pa);
+        error = collect_ground_reference(&reference_pressure_pa, deadline_us);
         if (error != ESP_OK)
         {
             report_sensor_error(error);
+            vTaskDelete(nullptr);
+            return;
+        }
+
+        if (esp_timer_get_time() >= deadline_us)
+        {
+            report_sensor_error(ESP_ERR_TIMEOUT);
             vTaskDelete(nullptr);
             return;
         }
@@ -466,6 +608,9 @@ namespace bmp280
         }
 
         task_started = true;
+        ground_reference_deadline_us =
+            esp_timer_get_time()
+            + static_cast<int64_t>(GROUND_REFERENCE_MAX_INIT_TIME_MS) * 1000;
         if (xTaskCreate(
                 ground_reference_task,
                 "bmp280_ref",

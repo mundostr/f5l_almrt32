@@ -7,6 +7,7 @@
 namespace bmp280
 {
     constexpr uint32_t PRESSURE_READING_INTERVAL_MS = 100;
+    constexpr uint32_t GROUND_REFERENCE_MAX_INIT_TIME_MS = 2000;
     constexpr uint8_t GROUND_REFERENCE_SAMPLE_COUNT = 15;
     constexpr float MOTOR_CUTOFF_ALTITUDE_M = 90.0F;
 
