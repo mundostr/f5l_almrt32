@@ -37,9 +37,36 @@ namespace bmp280
     constexpr uint8_t BMP280_FORCED_MEASUREMENT = 0x55;
     constexpr uint32_t ALTITUDE_MONITOR_START_NOTIFICATION = 1U << 0;
     constexpr uint32_t ALTITUDE_MONITOR_STOP_NOTIFICATION = 1U << 1;
+    constexpr size_t ALTITUDE_FILTER_SAMPLE_COUNT = 3;
     constexpr double ISA_ALTITUDE_COEFFICIENT_M = 44330.76923;
     constexpr double ISA_STANDARD_PRESSURE_HPA = 1013.25;
     constexpr double ISA_ALTITUDE_EXPONENT = 0.190266669;
+
+    struct AltitudeMedianFilter
+    {
+        std::array<double, ALTITUDE_FILTER_SAMPLE_COUNT> samples = {};
+        size_t sample_count = 0;
+        size_t next_sample = 0;
+
+        bool update(double altitude_m, double *filtered_altitude_m)
+        {
+            samples[next_sample] = altitude_m;
+            next_sample = (next_sample + 1) % samples.size();
+            if (sample_count < samples.size())
+            {
+                ++sample_count;
+            }
+            if (sample_count < samples.size())
+            {
+                return false;
+            }
+
+            auto ordered_samples = samples;
+            std::sort(ordered_samples.begin(), ordered_samples.end());
+            *filtered_altitude_m = ordered_samples[samples.size() / 2];
+            return true;
+        }
+    };
 
     struct CalibrationData
     {
@@ -325,6 +352,7 @@ namespace bmp280
     static bool monitor_altitude()
     {
         TickType_t last_wake_time = xTaskGetTickCount();
+        AltitudeMedianFilter altitude_filter = {};
         for (;;)
         {
             if (altitude_monitoring_stopped())
@@ -350,7 +378,9 @@ namespace bmp280
                 return false;
             }
 
-            if (altitude_delta_m >= MOTOR_CUTOFF_ALTITUDE_M)
+            double filtered_altitude_delta_m = 0.0;
+            if (altitude_filter.update(altitude_delta_m, &filtered_altitude_delta_m)
+                && filtered_altitude_delta_m >= MOTOR_CUTOFF_ALTITUDE_M)
             {
                 const esp_err_t post_error = fsm::post_event(fsm::Event::ALTITUDE_LIMIT_REACHED);
                 if (post_error != ESP_OK)
