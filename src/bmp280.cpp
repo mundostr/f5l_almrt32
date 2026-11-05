@@ -28,13 +28,18 @@ namespace bmp280
     constexpr uint32_t BMP280_TASK_STACK_SIZE = 4096;
     constexpr UBaseType_t BMP280_TASK_PRIORITY = 4;
     constexpr uint32_t BMP280_CONVERSION_DELAY_MS = 50;
-    constexpr float MINIMUM_PRESSURE_PA = 75000.0F;
-    constexpr float MAXIMUM_PRESSURE_PA = 105000.0F;
-    constexpr double MINIMUM_TEMPERATURE_C = 0.0;
-    constexpr double MAXIMUM_TEMPERATURE_C = 50.0;
+    constexpr float MINIMUM_PRESSURE_PA = 70000.0F;
+    constexpr float MAXIMUM_PRESSURE_PA = 110000.0F;
+    constexpr double MINIMUM_SENSOR_TEMPERATURE_C = -40.0;
+    constexpr double MAXIMUM_SENSOR_TEMPERATURE_C = 85.0;
     constexpr uint8_t BMP280_RESET_COMMAND = 0xB6;
     constexpr uint8_t BMP280_CONFIG_VALUE = 0x08;
     constexpr uint8_t BMP280_FORCED_MEASUREMENT = 0x55;
+    constexpr uint32_t ALTITUDE_MONITOR_START_NOTIFICATION = 1U << 0;
+    constexpr uint32_t ALTITUDE_MONITOR_STOP_NOTIFICATION = 1U << 1;
+    constexpr double ISA_ALTITUDE_COEFFICIENT_M = 44330.76923;
+    constexpr double ISA_STANDARD_PRESSURE_HPA = 1013.25;
+    constexpr double ISA_ALTITUDE_EXPONENT = 0.190266669;
 
     struct CalibrationData
     {
@@ -56,6 +61,9 @@ namespace bmp280
     static i2c_master_dev_handle_t sensor_device = nullptr;
     static CalibrationData calibration = {};
     static bool task_started = false;
+    static bool ground_reference_ready = false;
+    static double ground_reference_altitude_m = 0.0;
+    static TaskHandle_t sensor_task_handle = nullptr;
 
     static uint16_t read_u16_le(const uint8_t *data)
     {
@@ -201,7 +209,8 @@ namespace bmp280
             temperature_delta * temperature_delta * static_cast<double>(calibration.temperature_3);
         const double fine_temperature = temperature_value_1 + temperature_value_2;
         const double temperature_c = fine_temperature / 5120.0;
-        if (temperature_c < MINIMUM_TEMPERATURE_C || temperature_c > MAXIMUM_TEMPERATURE_C)
+        if (temperature_c < MINIMUM_SENSOR_TEMPERATURE_C
+            || temperature_c > MAXIMUM_SENSOR_TEMPERATURE_C)
         {
             return ESP_ERR_INVALID_RESPONSE;
         }
@@ -237,6 +246,15 @@ namespace bmp280
         return ESP_OK;
     }
 
+    static double calculate_isa_altitude_m(float pressure_pa)
+    {
+        const double pressure_hpa = static_cast<double>(pressure_pa) / 100.0;
+        return ISA_ALTITUDE_COEFFICIENT_M
+            * (1.0 - std::pow(
+                pressure_hpa / ISA_STANDARD_PRESSURE_HPA,
+                ISA_ALTITUDE_EXPONENT));
+    }
+
     static esp_err_t collect_ground_reference(float *reference_pressure_pa)
     {
         std::array<float, GROUND_REFERENCE_SAMPLE_COUNT> samples = {};
@@ -270,6 +288,84 @@ namespace bmp280
         return ESP_OK;
     }
 
+    static void report_monitor_error(esp_err_t error)
+    {
+        ESP_LOGE(TAG, "Altitude monitoring failed: %s", esp_err_to_name(error));
+        const esp_err_t post_error = fsm::post_event(fsm::Event::ALTITUDE_MONITOR_FAILED);
+        if (post_error != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Failed to notify FSM of altitude-monitor error: %s", esp_err_to_name(post_error));
+        }
+    }
+
+    static bool wait_for_monitor_start()
+    {
+        uint32_t notification_value = 0;
+        if (xTaskNotifyWait(0, UINT32_MAX, &notification_value, portMAX_DELAY) != pdTRUE)
+        {
+            return false;
+        }
+
+        return (notification_value & ALTITUDE_MONITOR_START_NOTIFICATION) != 0
+            && (notification_value & ALTITUDE_MONITOR_STOP_NOTIFICATION) == 0;
+    }
+
+    static bool altitude_monitoring_stopped()
+    {
+        uint32_t notification_value = 0;
+        const BaseType_t received = xTaskNotifyWait(
+            0,
+            ALTITUDE_MONITOR_STOP_NOTIFICATION,
+            &notification_value,
+            0);
+        return received == pdTRUE
+            && (notification_value & ALTITUDE_MONITOR_STOP_NOTIFICATION) != 0;
+    }
+
+    static bool monitor_altitude()
+    {
+        TickType_t last_wake_time = xTaskGetTickCount();
+        for (;;)
+        {
+            if (altitude_monitoring_stopped())
+            {
+                return true;
+            }
+
+            float pressure_pa = 0.0F;
+            const esp_err_t error = read_pressure_pa(&pressure_pa);
+            if (error != ESP_OK)
+            {
+                report_monitor_error(error);
+                return false;
+            }
+
+            const double current_altitude_m = calculate_isa_altitude_m(pressure_pa);
+            const double altitude_delta_m =
+                current_altitude_m - ground_reference_altitude_m;
+
+            if (!std::isfinite(altitude_delta_m))
+            {
+                report_monitor_error(ESP_ERR_INVALID_RESPONSE);
+                return false;
+            }
+
+            if (altitude_delta_m >= MOTOR_CUTOFF_ALTITUDE_M)
+            {
+                const esp_err_t post_error = fsm::post_event(fsm::Event::ALTITUDE_LIMIT_REACHED);
+                if (post_error != ESP_OK)
+                {
+                    ESP_LOGE(TAG, "Failed to notify FSM of altitude limit: %s", esp_err_to_name(post_error));
+                }
+                return false;
+            }
+
+            vTaskDelayUntil(
+                &last_wake_time,
+                pdMS_TO_TICKS(PRESSURE_READING_INTERVAL_MS));
+        }
+    }
+
     static void report_sensor_error(esp_err_t error)
     {
         ESP_LOGE(TAG, "BMP280 ground-reference capture failed: %s", esp_err_to_name(error));
@@ -300,13 +396,36 @@ namespace bmp280
         }
 
         ESP_LOGI(TAG, "Ground reference pressure: %.2f Pa", reference_pressure_pa);
+        ground_reference_altitude_m = calculate_isa_altitude_m(reference_pressure_pa);
+        if (!std::isfinite(ground_reference_altitude_m))
+        {
+            report_sensor_error(ESP_ERR_INVALID_RESPONSE);
+            vTaskDelete(nullptr);
+            return;
+        }
+        ground_reference_ready = true;
         error = fsm::post_event(fsm::Event::GROUND_REFERENCE_CAPTURED, reference_pressure_pa);
         if (error != ESP_OK)
         {
             ESP_LOGE(TAG, "Failed to notify FSM of ground reference: %s", esp_err_to_name(error));
         }
 
-        vTaskDelete(nullptr);
+        for (;;)
+        {
+            if (wait_for_monitor_start())
+            {
+                if (monitor_altitude())
+                {
+                    vTaskDelete(nullptr);
+                    return;
+                }
+            }
+            else
+            {
+                vTaskDelete(nullptr);
+                return;
+            }
+        }
     }
 
     esp_err_t start_ground_reference()
@@ -323,7 +442,7 @@ namespace bmp280
                 BMP280_TASK_STACK_SIZE,
                 nullptr,
                 BMP280_TASK_PRIORITY,
-                nullptr) != pdPASS)
+                &sensor_task_handle) != pdPASS)
         {
             task_started = false;
             return ESP_ERR_NO_MEM;
@@ -331,4 +450,30 @@ namespace bmp280
 
         return ESP_OK;
     }
-}
+
+    esp_err_t start_altitude_monitoring()
+    {
+        if (!task_started || !ground_reference_ready || sensor_task_handle == nullptr)
+        {
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        return xTaskNotify(
+            sensor_task_handle,
+            ALTITUDE_MONITOR_START_NOTIFICATION,
+            eSetBits) == pdPASS ? ESP_OK : ESP_FAIL;
+    }
+
+    esp_err_t stop_altitude_monitoring()
+    {
+        if (sensor_task_handle == nullptr)
+        {
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        return xTaskNotify(
+            sensor_task_handle,
+            ALTITUDE_MONITOR_STOP_NOTIFICATION,
+            eSetBits) == pdPASS ? ESP_OK : ESP_FAIL;
+    }
+    }

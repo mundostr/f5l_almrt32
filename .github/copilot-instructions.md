@@ -50,7 +50,7 @@ Altitude measurement details:
 - Firmware calculation accuracy: +-0.5 mts.
 - Sensor calibration: manufacturer calibration params must be incorporated.
 - Sensor temperature compensation: according to manufacturer recommendations.
-- ISA calculation: put formula here.
+- ISA calculation formula to use, with P in hPa: h = 44330.76923 * (1 - (P / 1013.25)**0.190266669). Differential altitude is h(current pressure) - h(ground-reference pressure).
 - Altitude calculation must be calculated at ground and at every new altitude reading.
 - Filtering or smoothing must be applied to try to reject readings peaks due to motor activation, flight dynamics o just wind gusts.
 
